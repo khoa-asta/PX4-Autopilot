@@ -35,78 +35,180 @@
  * @file AttitudeControl.cpp
  */
 
-#include <AttitudeControl.hpp>
+#include "AttitudeControl.hpp"
 
 #include <mathlib/math/Functions.hpp>
 
+#include <cmath>
+
 using namespace matrix;
 
-void AttitudeControl::setProportionalGain(const matrix::Vector3f &proportional_gain, const float yaw_weight)
+void AttitudeControl::setProportionalGain(const Vector3f &proportional_gain, float yaw_weight)
 {
 	_proportional_gain = proportional_gain;
 	_yaw_w = math::constrain(yaw_weight, 0.f, 1.f);
 
-	// compensate for the effect of the yaw weight rescaling the output
+	/*
+	 * PX4 ORIGINAL BEHAVIOUR:
+	 * yaw error is geometrically weighted below, therefore yaw P is divided by
+	 * the same weight so small-angle yaw gain remains unchanged.
+	 */
 	if (_yaw_w > 1e-4f) {
 		_proportional_gain(2) /= _yaw_w;
 	}
+
+	updateFuzzyConfiguration();
 }
 
-matrix::Vector3f AttitudeControl::update(const Quatf &q) const
+void AttitudeControl::setRateLimit(const Vector3f &rate_limit)
+{
+	_rate_limit = rate_limit;
+	updateFuzzyConfiguration();
+}
+
+void AttitudeControl::setFuzzyParameters(bool enabled,
+					const Vector3f &base_ki,
+					const Vector3f &base_kd,
+					const Vector3f &delta_kp_max,
+					const Vector3f &delta_ki_max,
+					const Vector3f &delta_kd_max,
+					float error_max,
+					float error_rate_max,
+					float integral_limit,
+					float integral_zone,
+					float derivative_cutoff_hz)
+{
+	const bool enable_changed = (_fuzzy_enabled != enabled);
+
+	_fuzzy_enabled = enabled;
+	_fuzzy_base_ki = base_ki;
+	_fuzzy_base_kd = base_kd;
+	_fuzzy_delta_kp_max = delta_kp_max;
+	_fuzzy_delta_ki_max = delta_ki_max;
+	_fuzzy_delta_kd_max = delta_kd_max;
+
+	_fuzzy_error_max = error_max;
+	_fuzzy_error_rate_max = error_rate_max;
+	_fuzzy_integral_limit = integral_limit;
+	_fuzzy_integral_zone = integral_zone;
+	_fuzzy_derivative_cutoff_hz = derivative_cutoff_hz;
+
+	updateFuzzyConfiguration();
+
+	if (enable_changed) {
+		resetFuzzy();
+	}
+}
+
+void AttitudeControl::updateFuzzyConfiguration()
+{
+	FuzzyAttitude::Config config{};
+	config.enabled = _fuzzy_enabled;
+	config.error_max = _fuzzy_error_max;
+	config.error_rate_max = _fuzzy_error_rate_max;
+	config.integral_limit = _fuzzy_integral_limit;
+	config.integral_zone = _fuzzy_integral_zone;
+	config.derivative_cutoff_hz = _fuzzy_derivative_cutoff_hz;
+
+	config.kp_base = _proportional_gain(0);
+	config.ki_base = _fuzzy_base_ki(0);
+	config.kd_base = _fuzzy_base_kd(0);
+	config.delta_kp_max = _fuzzy_delta_kp_max(0);
+	config.delta_ki_max = _fuzzy_delta_ki_max(0);
+	config.delta_kd_max = _fuzzy_delta_kd_max(0);
+	config.output_limit = _rate_limit(0);
+	_fuzzy_roll.configure(config);
+
+	config.kp_base = _proportional_gain(1);
+	config.ki_base = _fuzzy_base_ki(1);
+	config.kd_base = _fuzzy_base_kd(1);
+	config.delta_kp_max = _fuzzy_delta_kp_max(1);
+	config.delta_ki_max = _fuzzy_delta_ki_max(1);
+	config.delta_kd_max = _fuzzy_delta_kd_max(1);
+	config.output_limit = _rate_limit(1);
+	_fuzzy_pitch.configure(config);
+
+	/*
+	 * [FUZZY-PID MODIFICATION]
+	 * Bù yaw_weight cho cả P, I, D và các delta gain. 
+	 */
+	const float yaw_gain_compensation = (_yaw_w > 1e-4f) ? (1.f / _yaw_w) : 0.f;
+
+	config.kp_base = (_yaw_w > 1e-4f) ? _proportional_gain(2) : 0.f;
+	config.ki_base = _fuzzy_base_ki(2) * yaw_gain_compensation;
+	config.kd_base = _fuzzy_base_kd(2) * yaw_gain_compensation;
+	config.delta_kp_max = _fuzzy_delta_kp_max(2) * yaw_gain_compensation;
+	config.delta_ki_max = _fuzzy_delta_ki_max(2) * yaw_gain_compensation;
+	config.delta_kd_max = _fuzzy_delta_kd_max(2) * yaw_gain_compensation;
+	config.output_limit = _rate_limit(2);
+	_fuzzy_yaw.configure(config);
+}
+
+void AttitudeControl::resetFuzzy()
+{
+	_fuzzy_roll.reset();
+	_fuzzy_pitch.reset();
+	_fuzzy_yaw.reset();
+}
+
+Vector3f AttitudeControl::update(const Quatf &q, const Vector3f &angular_rates, float dt)
 {
 	Quatf qd = _attitude_setpoint_q;
 
-	// calculate reduced desired attitude neglecting vehicle's yaw to prioritize roll and pitch
+	// ===== PX4 ORIGINAL: reduced desired attitude, prioritize roll/pitch over yaw =====
 	const Vector3f e_z = q.dcm_z();
 	const Vector3f e_z_d = qd.dcm_z();
 	Quatf qd_red(e_z, e_z_d);
 
 	if (fabsf(qd_red(1)) > (1.f - 1e-5f) || fabsf(qd_red(2)) > (1.f - 1e-5f)) {
-		// In the infinitesimal corner case where the vehicle and thrust have the completely opposite direction,
-		// full attitude control anyways generates no yaw input and directly takes the combination of
-		// roll and pitch leading to the correct desired yaw. Ignoring this case would still be totally safe and stable.
 		qd_red = qd;
 
 	} else {
-		// Transform rotation from current to desired thrust vector into a world frame reduced desired attitude.
-		// This is a right multiplication as the tilt error quaternion is obtained from two Z vectors expressed in the world frame.
 		qd_red *= q;
 	}
 
-	// With a full desired attitude given by: qd = qd_red * qd_dyaw, extract the delta yaw component.
-	// By definition, the delta yaw quaternion has the form (cos(angle/2), 0, 0, sin(angle/2))
 	Quatf qd_dyaw = qd_red.inversed() * qd;
 	qd_dyaw.canonicalize();
-	// catch numerical problems with the domain of acosf and asinf
 	qd_dyaw(0) = math::constrain(qd_dyaw(0), -1.f, 1.f);
 	qd_dyaw(3) = math::constrain(qd_dyaw(3), -1.f, 1.f);
 
-	// scale the delta yaw angle and re-combine the desired attitude
-	qd = qd_red * Quatf(cosf(_yaw_w * acosf(qd_dyaw(0))), 0.f, 0.f, sinf(_yaw_w * asinf(qd_dyaw(3))));
+	qd = qd_red * Quatf(cosf(_yaw_w * acosf(qd_dyaw(0))),
+			     0.f, 0.f,
+			     sinf(_yaw_w * asinf(qd_dyaw(3))));
 
-	// quaternion attitude control law, qe is rotation from q to qd
+	// Quaternion error from current attitude q to desired attitude qd.
 	const Quatf qe = q.inversed() * qd;
-
-	// using sin(alpha/2) scaled rotation axis as attitude error (see quaternion definition by axis angle)
-	// also taking care of the antipodal unit quaternion ambiguity
 	const Vector3f eq = 2.f * qe.canonical().imag();
+	// ===== END PX4 ORIGINAL GEOMETRY =====
 
-	// calculate angular rates setpoint
-	Vector3f rate_setpoint = eq.emult(_proportional_gain);
+	Vector3f rate_setpoint{};
 
-	// Feed forward the yaw setpoint rate.
-	// yawspeed_setpoint is the feed forward commanded rotation around the world z-axis,
-	// but we need to apply it in the body frame (because _rates_sp is expressed in the body frame).
-	// Therefore we infer the world z-axis (expressed in the body frame) by taking the last column of R.transposed (== q.inversed)
-	// and multiply it by the yaw setpoint rate (yawspeed_setpoint).
-	// This yields a vector representing the commanded rotatation around the world z-axis expressed in the body frame
-	// such that it can be added to the rates setpoint.
+	if (_fuzzy_enabled) {
+		/*
+		 * [FUZZY-PID MODIFICATION]
+		 * dùng ba Fuzzy PID độc lập để tạo rate setpoint.
+		 *
+		 */
+		Vector3f error_rate = -angular_rates;
+
+		// qd yaw đã được nhân yaw_weight; de yaw cũng phải được nhân tương ứng.
+		error_rate(2) *= _yaw_w;
+
+		rate_setpoint(0) = _fuzzy_roll.update(eq(0), error_rate(0), dt);
+		rate_setpoint(1) = _fuzzy_pitch.update(eq(1), error_rate(1), dt);
+		rate_setpoint(2) = _fuzzy_yaw.update(eq(2), error_rate(2), dt);
+
+	} else {
+		// PX4 ORIGINAL fallback: giữ nguyên bộ P quaternion khi MC_FUZZY_EN = 0.
+		rate_setpoint = eq.emult(_proportional_gain);
+	}
+
+	// PX4 ORIGINAL: yaw-rate feed-forward expressed in body frame.
 	if (std::isfinite(_yawspeed_setpoint)) {
 		rate_setpoint += q.inversed().dcm_z() * _yawspeed_setpoint;
 	}
 
-	// limit rates
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 3; ++i) {
 		rate_setpoint(i) = math::constrain(rate_setpoint(i), -_rate_limit(i), _rate_limit(i));
 	}
 

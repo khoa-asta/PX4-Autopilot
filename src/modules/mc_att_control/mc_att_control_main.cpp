@@ -51,6 +51,7 @@
 
 #include "AttitudeControl/AttitudeControlMath.hpp"
 
+
 using namespace matrix;
 
 ModuleBase::Descriptor MulticopterAttitudeControl::desc{task_spawn, custom_command, print_usage};
@@ -90,17 +91,39 @@ MulticopterAttitudeControl::init()
 void
 MulticopterAttitudeControl::parameters_updated()
 {
-	// Store some of the parameters in a more convenient way & precompute often-used values
-	_attitude_control.setProportionalGain(Vector3f(_param_mc_roll_p.get(), _param_mc_pitch_p.get(), _param_mc_yaw_p.get()),
-					      _param_mc_yaw_weight.get());
+	// PX4 ORIGINAL: base proportional gains and yaw prioritization.
+	_attitude_control.setProportionalGain(
+		Vector3f(_param_mc_roll_p.get(), _param_mc_pitch_p.get(), _param_mc_yaw_p.get()),
+		_param_mc_yaw_weight.get());
 
-	// angular rate limits
 	using math::radians;
 
-	_attitude_control.setRateLimit(Vector3f(radians(_param_mc_rollrate_max.get()), radians(_param_mc_pitchrate_max.get()),
-						radians(_param_mc_yawrate_max.get())));
+	// PX4 ORIGINAL: hard angular-rate limits.
+	_attitude_control.setRateLimit(
+		Vector3f(radians(_param_mc_rollrate_max.get()),
+			 radians(_param_mc_pitchrate_max.get()),
+			 radians(_param_mc_yawrate_max.get())));
 
-	// Update from hover thrust parameter if there's no valid estimate in use
+	/*
+	 * FUZZY-PID 
+	 * Đọc toàn bộ tham số Fuzzy PID từ parameter server.
+	 * MC_FZ_DE_MAX được khai báo bằng deg/s trong QGC, sau đó đổi sang rad/s
+	 * trước khi truyền vào thuật toán để đồng nhất với vehicle_angular_velocity.
+	 */
+	_attitude_control.setFuzzyParameters(
+		_param_mc_fuzzy_en.get() == 1,
+		Vector3f(_param_mc_fz_r_i.get(), _param_mc_fz_p_i.get(), _param_mc_fz_y_i.get()),
+		Vector3f(_param_mc_fz_r_d.get(), _param_mc_fz_p_d.get(), _param_mc_fz_y_d.get()),
+		Vector3f(_param_mc_fz_r_dp.get(), _param_mc_fz_p_dp.get(), _param_mc_fz_y_dp.get()),
+		Vector3f(_param_mc_fz_r_di.get(), _param_mc_fz_p_di.get(), _param_mc_fz_y_di.get()),
+		Vector3f(_param_mc_fz_r_dd.get(), _param_mc_fz_p_dd.get(), _param_mc_fz_y_dd.get()),
+		_param_mc_fz_e_max.get(),
+		radians(_param_mc_fz_de_max.get()),
+		_param_mc_fz_i_lim.get(),
+		_param_mc_fz_i_zone.get(),
+		_param_mc_fz_d_lpf.get());
+
+	// Update from hover thrust parameter if there's no valid estimate in use.
 	if (!PX4_ISFINITE(_hover_thrust_estimate)) {
 		_hover_thrust_slew_rate.setForcedValue(_param_mpc_thr_hover.get());
 	}
@@ -339,9 +362,33 @@ MulticopterAttitudeControl::Run()
 				}
 
 				_quat_reset_counter = v_att.quat_reset_counter;
+
+				// FUZZY-PID:  EKF đổi hệ quy chiếu: xóa trạng thái I/D cũ.
+				_attitude_control.resetFuzzy();
+			}
+			/*
+			 * FUZZY-PID 
+			 * Fuzzy PID cần tốc độ góc hiện tại để xây dựng de.
+			 */
+			vehicle_angular_velocity_s angular_velocity{};
+			Vector3f current_rates{};
+
+			const bool angular_velocity_valid =
+				_vehicle_angular_velocity_sub.copy(&angular_velocity)
+				&& PX4_ISFINITE(angular_velocity.xyz[0])
+				&& PX4_ISFINITE(angular_velocity.xyz[1])
+				&& PX4_ISFINITE(angular_velocity.xyz[2])
+				&& (hrt_elapsed_time(&angular_velocity.timestamp_sample) < 100_ms);
+
+			if (angular_velocity_valid) {
+				current_rates = Vector3f{angular_velocity.xyz};
+
+			} else {
+				// Giữ P/I hoạt động nhưng vô hiệu tác dụng D khi dữ liệu gyro không hợp lệ.
+				current_rates.zero();
 			}
 
-			Vector3f rates_sp = _attitude_control.update(q);
+			Vector3f rates_sp = _attitude_control.update(q, current_rates, dt);
 
 			const hrt_abstime now = hrt_absolute_time();
 			autotune_attitude_control_status_s pid_autotune;
@@ -371,9 +418,14 @@ MulticopterAttitudeControl::Run()
 			_man_pitch_input_filter.reset(0.f);
 			_yaw_setpoint_stabilized = NAN;
 			_stick_yaw.reset(Eulerf(q).psi(), _unaided_heading);
+
+			// FUZZY-PID: Không giữ tích phân khi vòng attitude bị tắt.
+			_attitude_control.resetFuzzy();
 		}
 
 		if (_landed) {
+			// FUZZY-PID: Xóa tích phân trên mặt đất để tránh wind-up giữa hai lần bay.
+			_attitude_control.resetFuzzy();
 			_manual_throttle_minimum.update(0.f, dt);
 
 		} else {
@@ -385,6 +437,8 @@ MulticopterAttitudeControl::Run()
 
 		} else {
 			_manual_throttle_maximum.setForcedValue(0.f);
+			// FUZZY-PID:  không giữ trạng thái tích phân.
+			_attitude_control.resetFuzzy();
 		}
 
 		if (PX4_ISFINITE(_hover_thrust_estimate)) {
@@ -443,7 +497,9 @@ int MulticopterAttitudeControl::print_usage(const char *reason)
 This implements the multicopter attitude controller. It takes attitude
 setpoints (`vehicle_attitude_setpoint`) as inputs and outputs a rate setpoint.
 
-The controller has a P loop for angular error
+The controller uses quaternion attitude error. With MC_FUZZY_EN=0 it keeps
+the original PX4 proportional outer loop. With MC_FUZZY_EN=1 it uses a
+Fuzzy self-tuning PID outer loop to generate body-rate setpoints.
 
 Publication documenting the implemented Quaternion Attitude Control:
 Nonlinear Quadrocopter Attitude Control (2013)

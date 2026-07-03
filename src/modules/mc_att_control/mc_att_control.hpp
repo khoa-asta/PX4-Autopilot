@@ -24,10 +24,10 @@
  * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
  * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
  * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
- * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
- * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  *
  ****************************************************************************/
 
@@ -41,13 +41,15 @@
 #include <px4_platform_common/module_params.h>
 #include <px4_platform_common/posix.h>
 #include <px4_platform_common/px4_work_queue/WorkItem.hpp>
+
 #include <uORB/Publication.hpp>
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionCallback.hpp>
-#include <uORB/topics/manual_control_setpoint.h>
-#include <uORB/topics/parameter_update.h>
 #include <uORB/topics/autotune_attitude_control_status.h>
 #include <uORB/topics/hover_thrust_estimate.h>
+#include <uORB/topics/manual_control_setpoint.h>
+#include <uORB/topics/parameter_update.h>
+#include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_attitude_setpoint.h>
 #include <uORB/topics/vehicle_control_mode.h>
@@ -55,6 +57,7 @@
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_rates_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
+
 #include <lib/mathlib/math/filter/AlphaFilter.hpp>
 #include <lib/slew_rate/SlewRate.hpp>
 #include <lib/stick_yaw/StickYaw.hpp>
@@ -63,8 +66,7 @@
 
 using namespace time_literals;
 
-class MulticopterAttitudeControl : public ModuleBase, public ModuleParams,
-	public px4::WorkItem
+class MulticopterAttitudeControl : public ModuleBase, public ModuleParams, public px4::WorkItem
 {
 public:
 	static Descriptor desc;
@@ -72,33 +74,19 @@ public:
 	MulticopterAttitudeControl(bool vtol = false);
 	~MulticopterAttitudeControl() override;
 
-	/** @see ModuleBase */
 	static int task_spawn(int argc, char *argv[]);
-
-	/** @see ModuleBase */
 	static int custom_command(int argc, char *argv[]);
-
-	/** @see ModuleBase */
 	static int print_usage(const char *reason = nullptr);
 
 	bool init();
 
 private:
 	void Run() override;
-
-	/**
-	 * initialize some vectors/matrices from parameters
-	 */
 	void parameters_updated();
-
 	float throttle_curve(float throttle_stick_input);
-
-	/**
-	 * Generate & publish an attitude setpoint from stick inputs
-	 */
 	void generate_attitude_setpoint(const matrix::Quatf &q, float dt);
 
-	AttitudeControl _attitude_control; /**< class for attitude control calculations */
+	AttitudeControl _attitude_control;
 	StickYaw _stick_yaw{this};
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
@@ -112,34 +100,40 @@ private:
 	uORB::Subscription _vehicle_local_position_sub{ORB_ID(vehicle_local_position)};
 	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
 
+	/*
+	 * [FUZZY-PID MODIFICATION]
+	 * PX4 mc_att_control gốc không cần tốc độ góc vì vòng ngoài chỉ là P.
+	 * Nhánh D của Fuzzy PID cần omega_body để xấp xỉ de = -omega_body.
+	 */
+	uORB::Subscription _vehicle_angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
+
 	uORB::SubscriptionCallbackWorkItem _vehicle_attitude_sub{this, ORB_ID(vehicle_attitude)};
 
-	uORB::Publication<vehicle_rates_setpoint_s>     _vehicle_rates_setpoint_pub{ORB_ID(vehicle_rates_setpoint)};    /**< rate setpoint publication */
-	uORB::Publication<vehicle_attitude_setpoint_s>  _vehicle_attitude_setpoint_pub;
+	uORB::Publication<vehicle_rates_setpoint_s> _vehicle_rates_setpoint_pub{ORB_ID(vehicle_rates_setpoint)};
+	uORB::Publication<vehicle_attitude_setpoint_s> _vehicle_attitude_setpoint_pub;
 
-	manual_control_setpoint_s       _manual_control_setpoint {};    /**< manual control setpoint */
-	vehicle_control_mode_s          _vehicle_control_mode {};       /**< vehicle control mode */
+	manual_control_setpoint_s _manual_control_setpoint{};
+	vehicle_control_mode_s _vehicle_control_mode{};
 
-	perf_counter_t  _loop_perf;             /**< loop duration performance counter */
-
-	matrix::Vector3f _thrust_setpoint_body; /**< body frame 3D thrust vector */
+	perf_counter_t _loop_perf;
+	matrix::Vector3f _thrust_setpoint_body;
 
 	float _hover_thrust_estimate{NAN};
 	SlewRate<float> _hover_thrust_slew_rate{.5f};
 
 	float _yaw_setpoint_stabilized{0.f};
-	float _unaided_heading{NAN}; // initialized NAN to not distract heading lock when local position never published
-	float _man_tilt_max{0.f};			/**< maximum tilt allowed for manual flight [rad] */
+	float _unaided_heading{NAN};
+	float _man_tilt_max{0.f};
 
-	SlewRate<float> _manual_throttle_minimum{0.f}; ///< 0 when landed and ramped to MPC_MANTHR_MIN in air
-	SlewRate<float> _manual_throttle_maximum{0.f}; ///< 0 when disarmed ramped to 1 when spooled up
+	SlewRate<float> _manual_throttle_minimum{0.f};
+	SlewRate<float> _manual_throttle_maximum{0.f};
 	AlphaFilter<float> _man_roll_input_filter;
 	AlphaFilter<float> _man_pitch_input_filter;
 
 	hrt_abstime _last_run{0};
 	hrt_abstime _last_attitude_setpoint{0};
 
-	bool _spooled_up{false}; ///< used to make sure the vehicle cannot take off during the spoolup time
+	bool _spooled_up{false};
 	bool _landed{true};
 	bool _vehicle_type_rotary_wing{true};
 	bool _vtol{false};
@@ -149,17 +143,44 @@ private:
 	uint8_t _quat_reset_counter{0};
 
 	DEFINE_PARAMETERS(
-		(ParamInt<px4::params::MC_AIRMODE>)         _param_mc_airmode,
-		(ParamFloat<px4::params::MC_MAN_TILT_TAU>)  _param_mc_man_tilt_tau,
+		(ParamInt<px4::params::MC_AIRMODE>) _param_mc_airmode,
+		(ParamFloat<px4::params::MC_MAN_TILT_TAU>) _param_mc_man_tilt_tau,
 
-		(ParamFloat<px4::params::MC_ROLL_P>)        _param_mc_roll_p,
-		(ParamFloat<px4::params::MC_PITCH_P>)       _param_mc_pitch_p,
-		(ParamFloat<px4::params::MC_YAW_P>)         _param_mc_yaw_p,
-		(ParamFloat<px4::params::MC_YAW_WEIGHT>)    _param_mc_yaw_weight,
+		(ParamFloat<px4::params::MC_ROLL_P>) _param_mc_roll_p,
+		(ParamFloat<px4::params::MC_PITCH_P>) _param_mc_pitch_p,
+		(ParamFloat<px4::params::MC_YAW_P>) _param_mc_yaw_p,
+		(ParamFloat<px4::params::MC_YAW_WEIGHT>) _param_mc_yaw_weight,
 
-		(ParamFloat<px4::params::MC_ROLLRATE_MAX>)  _param_mc_rollrate_max,
+		(ParamFloat<px4::params::MC_ROLLRATE_MAX>) _param_mc_rollrate_max,
 		(ParamFloat<px4::params::MC_PITCHRATE_MAX>) _param_mc_pitchrate_max,
-		(ParamFloat<px4::params::MC_YAWRATE_MAX>)   _param_mc_yawrate_max,
+		(ParamFloat<px4::params::MC_YAWRATE_MAX>) _param_mc_yawrate_max,
+
+		/* [FUZZY-PID MODIFICATION] Global fuzzy configuration */
+		(ParamInt<px4::params::MC_FUZZY_EN>) _param_mc_fuzzy_en,
+		(ParamFloat<px4::params::MC_FZ_E_MAX>) _param_mc_fz_e_max,
+		(ParamFloat<px4::params::MC_FZ_DE_MAX>) _param_mc_fz_de_max,
+		(ParamFloat<px4::params::MC_FZ_D_LPF>) _param_mc_fz_d_lpf,
+		(ParamFloat<px4::params::MC_FZ_I_LIM>) _param_mc_fz_i_lim,
+		(ParamFloat<px4::params::MC_FZ_I_ZONE>) _param_mc_fz_i_zone,
+
+		/* Base I/D gains of the attitude outer loop */
+		(ParamFloat<px4::params::MC_FZ_R_I>) _param_mc_fz_r_i,
+		(ParamFloat<px4::params::MC_FZ_P_I>) _param_mc_fz_p_i,
+		(ParamFloat<px4::params::MC_FZ_Y_I>) _param_mc_fz_y_i,
+		(ParamFloat<px4::params::MC_FZ_R_D>) _param_mc_fz_r_d,
+		(ParamFloat<px4::params::MC_FZ_P_D>) _param_mc_fz_p_d,
+		(ParamFloat<px4::params::MC_FZ_Y_D>) _param_mc_fz_y_d,
+
+		/* Maximum fuzzy increments dKp, dKi, dKd */
+		(ParamFloat<px4::params::MC_FZ_R_DP>) _param_mc_fz_r_dp,
+		(ParamFloat<px4::params::MC_FZ_R_DI>) _param_mc_fz_r_di,
+		(ParamFloat<px4::params::MC_FZ_R_DD>) _param_mc_fz_r_dd,
+		(ParamFloat<px4::params::MC_FZ_P_DP>) _param_mc_fz_p_dp,
+		(ParamFloat<px4::params::MC_FZ_P_DI>) _param_mc_fz_p_di,
+		(ParamFloat<px4::params::MC_FZ_P_DD>) _param_mc_fz_p_dd,
+		(ParamFloat<px4::params::MC_FZ_Y_DP>) _param_mc_fz_y_dp,
+		(ParamFloat<px4::params::MC_FZ_Y_DI>) _param_mc_fz_y_di,
+		(ParamFloat<px4::params::MC_FZ_Y_DD>) _param_mc_fz_y_dd,
 
 		/* Stabilized mode params */
 		(ParamFloat<px4::params::MAN_DEADZONE>) _param_man_deadzone,

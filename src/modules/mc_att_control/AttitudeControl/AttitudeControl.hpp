@@ -46,10 +46,18 @@
  * https://www.research-collection.ethz.ch/bitstream/handle/20.500.11850/154099/eth-7387-01.pdf
  */
 
+/**
+ * @file AttitudeControl.hpp
+ *
+ * Quaternion attitude controller extended with a Fuzzy self-tuning PID outer loop.
+ */
+
 #pragma once
 
 #include <matrix/matrix/math.hpp>
 #include <mathlib/math/Limits.hpp>
+
+#include "FuzzyAttitude.hpp"
 
 class AttitudeControl
 {
@@ -58,35 +66,43 @@ public:
 	~AttitudeControl() = default;
 
 	/**
-	 * Set proportional attitude control gain
-	 * @param proportional_gain 3D vector containing gains for roll, pitch, yaw
-	 * @param yaw_weight A fraction [0,1] deprioritizing yaw compared to roll and pitch
+	 * Set base proportional attitude gains.
+	 * These remain the original PX4 MC_ROLL_P, MC_PITCH_P and MC_YAW_P gains.
 	 */
-	void setProportionalGain(const matrix::Vector3f &proportional_gain, const float yaw_weight);
+	void setProportionalGain(const matrix::Vector3f &proportional_gain, float yaw_weight);
+
+	/** Set hard limit for output angular-rate setpoints [rad/s]. */
+	void setRateLimit(const matrix::Vector3f &rate_limit);
 
 	/**
-	 * Set hard limit for output rate setpoints
-	 * @param rate_limit [rad/s] 3D vector containing limits for roll, pitch, yaw
+	 * [FUZZY-PID MODIFICATION]
+	 * Configure the Fuzzy PID increments and the new I/D base gains.
+	 *
+	 * PX4 gốc chỉ có P tại vòng thái độ. Đồ án dùng công thức
+	 * (Kp + dKp)e + (Ki + dKi)Integral(e) + (Kd + dKd)de.
 	 */
-	void setRateLimit(const matrix::Vector3f &rate_limit) { _rate_limit = rate_limit; }
+	void setFuzzyParameters(bool enabled,
+				const matrix::Vector3f &base_ki,
+				const matrix::Vector3f &base_kd,
+				const matrix::Vector3f &delta_kp_max,
+				const matrix::Vector3f &delta_ki_max,
+				const matrix::Vector3f &delta_kd_max,
+				float error_max,
+				float error_rate_max,
+				float integral_limit,
+				float integral_zone,
+				float derivative_cutoff_hz);
 
-	/**
-	 * Set a new attitude setpoint replacing the one tracked before
-	 * @param qd desired vehicle attitude setpoint
-	 * @param yawspeed_setpoint [rad/s] yaw feed forward angular rate in world frame
-	 */
-	void setAttitudeSetpoint(const matrix::Quatf &qd, const float yawspeed_setpoint)
+	void resetFuzzy();
+	bool fuzzyEnabled() const { return _fuzzy_enabled; }
+
+	void setAttitudeSetpoint(const matrix::Quatf &qd, float yawspeed_setpoint)
 	{
 		_attitude_setpoint_q = qd;
 		_attitude_setpoint_q.normalize();
 		_yawspeed_setpoint = yawspeed_setpoint;
 	}
 
-	/**
-	 * Adjust last known attitude setpoint by a delta rotation
-	 * Optional use to avoid glitches when attitude estimate reference e.g. heading changes.
-	 * @param q_delta delta rotation to apply
-	 */
 	void adaptAttitudeSetpoint(const matrix::Quatf &q_delta)
 	{
 		_attitude_setpoint_q = q_delta * _attitude_setpoint_q;
@@ -94,17 +110,41 @@ public:
 	}
 
 	/**
-	 * Run one control loop cycle calculation
-	 * @param q estimation of the current vehicle attitude unit quaternion
-	 * @return [rad/s] body frame 3D angular rate setpoint vector to be executed by the rate controller
+	 * Run one control cycle.
+	 * @param q Current attitude quaternion.
+	 * @param angular_rates Current body angular rates [rad/s].
+	 * @param dt Control period [s].
+	 * @return Body angular-rate setpoint [rad/s].
 	 */
-	matrix::Vector3f update(const matrix::Quatf &q) const;
+	matrix::Vector3f update(const matrix::Quatf &q,
+				const matrix::Vector3f &angular_rates,
+				float dt);
 
 private:
-	matrix::Vector3f _proportional_gain;
-	matrix::Vector3f _rate_limit;
-	float _yaw_w{0.f}; ///< yaw weight [0,1] to deprioritize compared to roll and pitch
+	void updateFuzzyConfiguration();
 
-	matrix::Quatf _attitude_setpoint_q; ///< latest known attitude setpoint e.g. from position control
-	float _yawspeed_setpoint{0.f}; ///< latest known yawspeed feed-forward setpoint
+	matrix::Vector3f _proportional_gain{};
+	matrix::Vector3f _rate_limit{};
+	float _yaw_w{0.f};
+
+	matrix::Quatf _attitude_setpoint_q{};
+	float _yawspeed_setpoint{0.f};
+
+	// FUZZY-PID
+	FuzzyAttitude _fuzzy_roll;
+	FuzzyAttitude _fuzzy_pitch;
+	FuzzyAttitude _fuzzy_yaw;
+
+	bool _fuzzy_enabled{false};
+	matrix::Vector3f _fuzzy_base_ki{};
+	matrix::Vector3f _fuzzy_base_kd{};
+	matrix::Vector3f _fuzzy_delta_kp_max{};
+	matrix::Vector3f _fuzzy_delta_ki_max{};
+	matrix::Vector3f _fuzzy_delta_kd_max{};
+
+	float _fuzzy_error_max{0.5f};
+	float _fuzzy_error_rate_max{0.8726646f};
+	float _fuzzy_integral_limit{0.15f};
+	float _fuzzy_integral_zone{0.20f};
+	float _fuzzy_derivative_cutoff_hz{20.f};
 };
