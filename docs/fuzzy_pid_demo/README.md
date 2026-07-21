@@ -1,1 +1,1 @@
-docs: add Fuzzy PID demonstration
+Fuzzy PID
